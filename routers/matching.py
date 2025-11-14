@@ -111,7 +111,18 @@ async def call_ai_agent_batch(workflow_id: str, jd_text: str, resumes: List[dict
     
     try:
         print(f"🤖 Calling AI Agent at {AI_AGENT_URL}/compare-batch")
-        async with httpx.AsyncClient(timeout=AI_AGENT_TIMEOUT) as client:
+        print(f"📊 Sending {len(resumes)} resumes to AI Agent")
+        
+        # Create timeout with separate connect, read, write, and pool timeouts
+        # For large responses, we need a longer read timeout
+        timeout_config = httpx.Timeout(
+            connect=30.0,  # 30 seconds to establish connection
+            read=AI_AGENT_TIMEOUT,  # Full timeout for reading response
+            write=60.0,  # 60 seconds to write request
+            pool=30.0  # 30 seconds to get connection from pool
+        )
+        
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
             response = await client.post(
                 f"{AI_AGENT_URL}/compare-batch",
                 json={
@@ -122,10 +133,21 @@ async def call_ai_agent_batch(workflow_id: str, jd_text: str, resumes: List[dict
             )
             
             if response.status_code == 200:
-                print(f"✅ AI Agent responded successfully")
-                return response.json()
+                print(f"✅ AI Agent responded successfully (Status: {response.status_code})")
+                print(f"📦 Response size: {len(response.content)} bytes")
+                
+                # Parse JSON response (this can take time for large responses)
+                try:
+                    result = response.json()
+                    print(f"✅ Successfully parsed JSON response with {len(result.get('results', []))} results")
+                    return result
+                except Exception as json_error:
+                    error_msg = f"Failed to parse AI Agent JSON response: {str(json_error)}"
+                    print(f"❌ {error_msg}")
+                    print(f"📄 Response preview: {response.text[:500]}")
+                    raise Exception(error_msg)
             else:
-                error_msg = f"AI Agent returned error: {response.status_code} - {response.text}"
+                error_msg = f"AI Agent returned error: {response.status_code} - {response.text[:500]}"
                 print(f"❌ {error_msg}")
                 raise Exception(error_msg)
     
@@ -320,25 +342,29 @@ async def batch_match_resumes(  # ✅ Made async!
         )
         
         print(f"✅ AI Agent completed for workflow: {workflow_id}")
+        print(f"📊 Received {len(ai_results.get('results', []))} results from AI Agent")
         
         # Save results to database
         processed_count = 0
-        for result in ai_results["results"]:
+        failed_count = 0
+        total_results = len(ai_results.get("results", []))
+        
+        for idx, result in enumerate(ai_results.get("results", []), 1):
             try:
-                print(f"💾 Saving result for resume: {result['resume_id']}")
+                print(f"💾 [{idx}/{total_results}] Saving result for resume: {result.get('resume_id', 'unknown')}")
                 result_doc = {
                     "resume_id": crud.object_id(result["resume_id"]),
                     "jd_id": batch_request.jd_id,
                     "workflow_id": workflow_id,  # Added workflow_id
-                    "match_score": result["match_score"],
-                    "fit_category": result["fit_category"],
-                    "jd_extracted": result["jd_extracted"],
-                    "resume_extracted": result["resume_extracted"],
-                    "match_breakdown": result["match_breakdown"],
-                    "selection_reason": result["selection_reason"],
+                    "match_score": result.get("match_score", 0),
+                    "fit_category": result.get("fit_category", "Unknown"),
+                    "jd_extracted": result.get("jd_extracted", {}),
+                    "resume_extracted": result.get("resume_extracted", {}),
+                    "match_breakdown": result.get("match_breakdown", {}),
+                    "selection_reason": result.get("selection_reason", ""),
                     "agent_version": "v1.0.0",
                     "processing_duration_ms": ai_results.get("processing_time_ms", 0),
-                    "confidence_score": result.get("confidence_score")
+                    "confidence_score": result.get("confidence_score", "Unknown")
                 }
                 
                 # Check if result already exists
@@ -351,13 +377,16 @@ async def batch_match_resumes(  # ✅ Made async!
                     crud.delete_result(db, existing_result["_id"])
                 
                 result_id = crud.create_resume_result(db, result_doc)
-                print(f"✅ Saved result with ID: {result_id}")
+                print(f"✅ [{idx}/{total_results}] Saved result with ID: {result_id}")
                 processed_count += 1
             except Exception as save_error:
-                print(f"❌ Error saving result for resume {result['resume_id']}: {save_error}")
+                failed_count += 1
+                print(f"❌ [{idx}/{total_results}] Error saving result for resume {result.get('resume_id', 'unknown')}: {save_error}")
                 import traceback
                 traceback.print_exc()
                 # Continue with next resume even if this one fails
+        
+        print(f"📊 Save summary: {processed_count} succeeded, {failed_count} failed out of {total_results} total")
         
         # Update workflow status to completed
         crud.update_workflow_status(db, workflow_id, {
@@ -496,7 +525,7 @@ def get_jd_results(
 @router.get("/top-matches/{jd_id}", response_model=schemas.TopMatchesResponse)
 def get_top_matches(
     jd_id: str,
-    limit: int = Query(10, ge=1, le=50),
+    limit: int = Query(100, ge=1, le=500),  # Increased max limit to 500 to support large batches
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_db)
 ):
@@ -504,7 +533,7 @@ def get_top_matches(
     Get top matching candidates for a job description
     
     - **jd_id**: Job Description custom ID
-    - **limit**: Number of top matches to return (max 50)
+    - **limit**: Number of top matches to return (max 500, default 100)
     """
     # Get JD
     jd = crud.get_jd_by_id(db, jd_id)
@@ -627,6 +656,18 @@ def get_top_matches(
         workflow_id = workflow_map.get(result["resume_id"])
         print(f"   Workflow ID: {workflow_id}")
         
+        # Handle email - might be string or list
+        email_value = resume_data.get("Email") or resume_data.get("email") or ""
+        if isinstance(email_value, list):
+            # If email is a list, take the first one or join with comma
+            email_value = email_value[0] if email_value else ""
+        
+        # Handle phone - might be string or list
+        phone_value = resume_data.get("Mobile") or resume_data.get("phone") or ""
+        if isinstance(phone_value, list):
+            # If phone is a list, take the first one
+            phone_value = phone_value[0] if phone_value else ""
+        
         top_matches.append({
             "id": result["_id"],
             "resume_id": str(result["resume_id"]),
@@ -634,8 +675,8 @@ def get_top_matches(
             "workflow_id": workflow_id,
             "candidate_name": resume_data.get("Name") or resume_data.get("candidate_name") or "Unknown",
             "current_position": current_position or "Unknown Position",
-            "email": resume_data.get("Email") or resume_data.get("email") or "",
-            "phone": resume_data.get("Mobile") or resume_data.get("phone") or "",
+            "email": email_value if isinstance(email_value, str) else "",
+            "phone": phone_value if isinstance(phone_value, str) else "",
             "location": resume_data.get("Current_Location") or resume_data.get("location") or "",
             "total_experience": parse_experience(resume_data.get("Total_Experience_Years") or resume_data.get("total_experience")),
             "skills_matched": flatten_skills(resume_data.get("Technical_Skills") or resume_data.get("skills_matched") or []),

@@ -94,16 +94,22 @@ async def get_workflow_status(
         avg_processing_time = sum(processing_times) / len(processing_times) if processing_times else 0
         
         # Get match statistics for THIS workflow only
+        # Remove limit to count ALL matches for accurate fit category counts
         if recent_workflow and resume_ids and jd_id:
             matches = list(db[RESUME_RESULT_COLLECTION].find({
                 "resume_id": {"$in": resume_ids},
                 "jd_id": jd_id
-            }).limit(100))
+            }))
         else:
             matches = []
         
         high_matches = [m for m in matches if m.get("match_score", 0) >= 80]
         match_rate = (len(high_matches) / len(matches) * 100) if matches else 0
+        
+        # Calculate fit category counts based on match scores (using ALL matches, not limited)
+        best_fit_count = len([m for m in matches if m.get("match_score", 0) >= 80])
+        partial_fit_count = len([m for m in matches if 50 <= m.get("match_score", 0) < 80])
+        not_fit_count = len([m for m in matches if m.get("match_score", 0) < 50])
         
         # Build agent statuses
         # Note: Only HR Comparator is actual AI agent
@@ -226,7 +232,10 @@ async def get_workflow_status(
                 "totalCandidates": total_resumes,
                 "processingTime": f"{total_processing_time:.1f}s" if total_processing_time > 0 else "0s",
                 "matchRate": f"{int(match_rate)}%" if matches else "0%",
-                "topMatches": len(high_matches)
+                "topMatches": len(high_matches),
+                "bestFit": best_fit_count,
+                "partialFit": partial_fit_count,
+                "notFit": not_fit_count
             },
             "progress": {
                 "completed": completed_agents,
