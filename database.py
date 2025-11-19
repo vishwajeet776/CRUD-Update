@@ -12,7 +12,7 @@ MONGODB_URL = os.getenv(
     "MONGODB_URL",
     "mongodb://localhost:27017"
 )
-DATABASE_NAME = os.getenv("DATABASE_NAME", "hr_resume_comparator")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "pod_1")
 
 # System Limits
 FREE_PLAN_RESUME_LIMIT = 100  # Max resumes per workflow (increased from 10)
