@@ -49,7 +49,7 @@ def create_resume(
 @router.get("/", response_model=List[schemas.ResumeListResponse])
 def list_resumes(
     skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=100),
+    limit: int = Query(130, ge=1, le=130),
     source: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
     db: Database = Depends(get_db)
